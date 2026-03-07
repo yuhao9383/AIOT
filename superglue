@@ -1,0 +1,212 @@
+import torch
+import numpy as np
+import time
+import argparse
+from pathlib import Path
+import matplotlib.cm as cm
+from PIL import Image
+import json
+import cv2
+
+from lightglue import LightGlue, SuperPoint
+from lightglue.utils import load_image, rbd
+from lightglue import viz2d
+
+
+def init_model():
+
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    print(f"🚀 初始化 LightGlue 模型...（device: {device}）")
+
+    extractor = SuperPoint(max_num_keypoints=1024).eval().to(device)
+    matcher = LightGlue(features="superpoint").eval().to(device)
+
+    return extractor, matcher, device
+
+
+def save_json_and_optional_plot(image0, image1, kpts0, kpts1,
+                                 mkpts0, mkpts1, mconf,
+                                 output_path, draw_plot=False, top_k='all',
+                                 scale0=(1.0, 1.0), scale1=(1.0, 1.0)):
+
+    viz_path = Path(output_path)
+
+    mkpts0_orig = mkpts0.copy()
+    mkpts1_orig = mkpts1.copy()
+
+    mkpts0_orig[:,0] *= scale0[0]
+    mkpts0_orig[:,1] *= scale0[1]
+
+    mkpts1_orig[:,0] *= scale1[0]
+    mkpts1_orig[:,1] *= scale1[1]
+
+    sorted_indices = np.argsort(-mconf)
+
+    mkpts0_orig = mkpts0_orig[sorted_indices]
+    mkpts1_orig = mkpts1_orig[sorted_indices]
+    mconf_sorted = mconf[sorted_indices]
+
+    json_path = viz_path.with_suffix('.json')
+
+    match_data = []
+
+    for pt0, pt1, conf in zip(mkpts0_orig, mkpts1_orig, mconf_sorted):
+
+        match_data.append({
+            'x0': round(float(pt0[0]),2),
+            'y0': round(float(pt0[1]),2),
+            'x1': round(float(pt1[0]),2),
+            'y1': round(float(pt1[1]),2),
+            'confidence': round(float(conf),4)
+        })
+
+    with open(json_path,'w',encoding='utf-8') as f:
+        json.dump(match_data,f,indent=2,ensure_ascii=False)
+
+    print(f"📝 JSON輸出：{json_path}")
+
+    if draw_plot:
+
+        if isinstance(top_k,int) and top_k < len(mconf):
+
+            top_indices = sorted_indices[:top_k]
+
+            mkpts0_vis = mkpts0[top_indices]
+            mkpts1_vis = mkpts1[top_indices]
+            mconf_vis = mconf[top_indices]
+
+        else:
+
+            mkpts0_vis = mkpts0
+            mkpts1_vis = mkpts1
+            mconf_vis = mconf
+
+        color = cm.jet(mconf_vis)
+
+        viz2d.plot_images([image0, image1])
+
+        viz2d.plot_matches(
+            mkpts0_vis,
+            mkpts1_vis,
+            color=color
+        )
+
+        viz2d.save_plot(viz_path)
+
+        print(f"🖼️ 匹配圖輸出：{viz_path}")
+
+
+def run_matching(extractor, matcher, device,
+                 img0_path, img1_path,
+                 enable_viz=False, top_k='all',
+                 output_dir=Path("output")):
+
+    print(f"\n🔍 開始匹配")
+
+    output_dir.mkdir(parents=True,exist_ok=True)
+
+    w0,h0 = Image.open(img0_path).size
+    w1,h1 = Image.open(img1_path).size
+
+    resize_wh = (640,480)
+
+    image0 = cv2.resize(cv2.imread(img0_path), resize_wh)
+    image1 = cv2.resize(cv2.imread(img1_path), resize_wh)
+
+    scale0 = (w0/resize_wh[0], h0/resize_wh[1])
+    scale1 = (w1/resize_wh[0], h1/resize_wh[1])
+
+    img0_tensor = load_image(img0_path).to(device)
+    img1_tensor = load_image(img1_path).to(device)
+
+    start_time = time.time()
+
+    feats0 = extractor.extract(img0_tensor)
+    feats1 = extractor.extract(img1_tensor)
+
+    matches01 = matcher({"image0": feats0, "image1": feats1})
+
+    feats0, feats1, matches01 = [
+        rbd(x) for x in [feats0, feats1, matches01]
+    ]
+
+    kpts0 = feats0["keypoints"].cpu().numpy()
+    kpts1 = feats1["keypoints"].cpu().numpy()
+
+    matches = matches01["matches"].cpu().numpy()
+
+    mkpts0 = kpts0[matches[:,0]]
+    mkpts1 = kpts1[matches[:,1]]
+
+    mconf = matches01["scores"].cpu().numpy()
+
+    elapsed = time.time() - start_time
+
+    print(f"✅ 匹配點數：{len(mkpts0)}")
+    print(f"⏱️ 時間：{elapsed:.4f} 秒")
+
+    img0_name = Path(img0_path).stem
+    img1_name = Path(img1_path).stem
+
+    output_path = output_dir / f"{img0_name}_{img1_name}_matches.png"
+
+    save_json_and_optional_plot(
+        image0, image1,
+        kpts0, kpts1,
+        mkpts0, mkpts1,
+        mconf,
+        output_path,
+        draw_plot=enable_viz,
+        top_k=top_k,
+        scale0=scale0,
+        scale1=scale1
+    )
+
+
+if __name__ == '__main__':
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--viz', action='store_true')
+    args = parser.parse_args()
+
+    extractor, matcher, device = init_model()
+
+    print("✅ LightGlue 初始化完成")
+
+    output_dir_input = input("請輸入輸出資料夾（預設output）：").strip()
+
+    if output_dir_input == '':
+        output_dir = Path("output")
+    else:
+        output_dir = Path(output_dir_input)
+
+    output_dir.mkdir(parents=True,exist_ok=True)
+
+    top_k_input = input("輸入要顯示的匹配數量（all或數字）：").strip()
+
+    if top_k_input.lower() == 'all':
+        top_k = 'all'
+    elif top_k_input.isdigit():
+        top_k = int(top_k_input)
+    else:
+        top_k = 'all'
+
+    while True:
+
+        img0 = input("\n輸入圖片1（q離開）：").strip()
+
+        if img0.lower() == 'q':
+            break
+
+        img1 = input("輸入圖片2：").strip()
+
+        run_matching(
+            extractor,
+            matcher,
+            device,
+            img0,
+            img1,
+            enable_viz=args.viz,
+            top_k=top_k,
+            output_dir=output_dir
+        )
