@@ -1,0 +1,75 @@
+import torch
+import numpy as np
+from pathlib import Path
+import matplotlib.cm as cm
+
+from lightglue import LightGlue, SuperPoint
+from lightglue.utils import load_image, rbd
+from lightglue import viz2d
+
+
+# === 設定圖片與輸出路徑 ===
+img0_path = Path(r"D:\vscode\D-project\test\photo1.jpg")
+img1_path = Path(r"D:\vscode\D-project\test\photo2.jpg")
+
+output_path = Path(r"D:\vscode\D-project\test\output\LightGluetest.png")
+output_path.parent.mkdir(exist_ok=True)
+
+
+# === 初始化模型 ===
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
+print(f"✅ 使用設備：{device}")
+
+extractor = SuperPoint(max_num_keypoints=1024).eval().to(device)
+matcher = LightGlue(features="superpoint").eval().to(device)
+
+
+# === 讀取圖片 ===
+image0 = load_image(img0_path).to(device)
+image1 = load_image(img1_path).to(device)
+
+
+# === 開始匹配 ===
+feats0 = extractor.extract(image0)
+feats1 = extractor.extract(image1)
+
+matches01 = matcher({"image0": feats0, "image1": feats1})
+
+feats0, feats1, matches01 = [
+    rbd(x) for x in [feats0, feats1, matches01]
+]
+
+
+# === 取得 keypoints ===
+kpts0 = feats0["keypoints"].cpu().numpy()
+kpts1 = feats1["keypoints"].cpu().numpy()
+
+matches = matches01["matches"].cpu().numpy()
+scores = matches01["scores"].cpu().numpy()
+
+
+# === 對應匹配點 ===
+mkpts0 = kpts0[matches[:, 0]]
+mkpts1 = kpts1[matches[:, 1]]
+
+
+# === 印出前10個匹配點 ===
+top_k = 10
+top_idx = np.argsort(-scores)[:top_k]
+
+print(f"\n✅ 匹配完成，總匹配點數：{len(mkpts0)}，前 {top_k} 筆如下：")
+
+for i in top_idx:
+    print(
+        f"[{i+1}] img1: {mkpts0[i]} -> img2: {mkpts1[i]} | confidence: {scores[i]:.4f}"
+    )
+
+
+# === 畫匹配圖 ===
+color = cm.jet(scores[top_idx])
+
+viz2d.plot_images([image0.cpu(), image1.cpu()])
+viz2d.plot_matches(mkpts0[top_idx], mkpts1[top_idx], color=color)
+viz2d.save_plot(output_path)
+
+print(f"\n🖼️ 匹配圖已儲存至：{output_path.resolve()}")
