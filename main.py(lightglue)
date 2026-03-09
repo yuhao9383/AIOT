@@ -2,172 +2,44 @@ import asyncio
 import json
 import sys, os
 from pathlib import Path
-import torch
-import numpy as np
-from PIL import Image
-import matplotlib.cm as cm
+
+# 匯入 LightGlue 模型
+sys.path.append(os.path.join(os.path.dirname(__file__), 'module'))
+from module.lightglue import init_model, run_matching
+from module.websocket import connect_and_handshake, listen_one
+from module.pnp import run_solvepnp_from_json
 
 # =======================
-# ===== LightGlue 核心函數 =====
+# ===== 狀態變數 =====
 # =======================
-
-# 假設 LightGlue 模型結構與 SuperGlue 相似
-lightglue_lib_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "lightglue_lib"))
-sys.path.append(lightglue_lib_path)
-from models.matching import Matching
-from models.utils import read_image, make_matching_plot
-
-def init_model():
-    """
-    初始化 LightGlue 模型
-    """
-    config = {
-        'superpoint': {
-            'nms_radius': 4,
-            'keypoint_threshold': 0.005,
-            'max_keypoints': 1024,
-        },
-        'superglue': {
-            'weights': 'outdoor',
-            'sinkhorn_iterations': 20,
-            'match_threshold': 0.2,
-        }
-    }
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    print(f"🚀 初始化 LightGlue 模型中...（device: {device}）")
-    matching = Matching(config).eval().to(device)
-    return matching, device
-
-def save_json_and_optional_plot(image0, image1, kpts0, kpts1,
-                                mkpts0, mkpts1, mconf,
-                                output_path, draw_plot=False, top_k='all',
-                                scale0=(1.0, 1.0), scale1=(1.0, 1.0)):
-    viz_path = Path(output_path)
-
-    mkpts0_orig = mkpts0.copy()
-    mkpts1_orig = mkpts1.copy()
-    mkpts0_orig[:, 0] *= scale0[0]
-    mkpts0_orig[:, 1] *= scale0[1]
-    mkpts1_orig[:, 0] *= scale1[0]
-    mkpts1_orig[:, 1] *= scale1[1]
-
-    sorted_indices = np.argsort(-mconf)
-    mkpts0_orig = mkpts0_orig[sorted_indices]
-    mkpts1_orig = mkpts1_orig[sorted_indices]
-    mconf_sorted = mconf[sorted_indices]
-
-    # 輸出 JSON
-    json_path = viz_path.with_suffix('.json')
-    match_data = []
-    for pt0, pt1, conf in zip(mkpts0_orig, mkpts1_orig, mconf_sorted):
-        match_data.append({
-            'x0': round(float(pt0[0]), 2),
-            'y0': round(float(pt0[1]), 2),
-            'x1': round(float(pt1[0]), 2),
-            'y1': round(float(pt1[1]), 2),
-            'confidence': round(float(conf), 4)
-        })
-    with open(json_path, 'w', encoding='utf-8') as f:
-        json.dump(match_data, f, indent=2, ensure_ascii=False)
-    print(f"📝 匹配資訊已輸出（JSON）：{json_path}")
-
-    # 備份 JSON
-    json_path_alt = json_path.with_name(json_path.stem.replace("_matches", "_pixel_pairs") + ".json")
-    with open(json_path_alt, 'w', encoding='utf-8') as f:
-        json.dump(match_data, f, indent=2, ensure_ascii=False)
-    print(f"📁 匹配資料也儲存至備份檔：{json_path_alt}")
-
-    # 可選視覺化
-    if draw_plot:
-        if isinstance(top_k, int) and top_k < len(mconf):
-            top_indices = sorted_indices[:top_k]
-            mkpts0_vis = mkpts0[top_indices]
-            mkpts1_vis = mkpts1[top_indices]
-            mconf_vis = mconf[top_indices]
-        else:
-            mkpts0_vis = mkpts0
-            mkpts1_vis = mkpts1
-            mconf_vis = mconf
-
-        color = cm.jet(mconf_vis)
-        text = ['LightGlue', f'Matches shown: {len(mkpts0_vis)}']
-        small_text = ['Keypoint Threshold: 0.005', 'Match Threshold: 0.2']
-        make_matching_plot(
-            image0, image1, kpts0, kpts1, mkpts0_vis, mkpts1_vis, color,
-            text, viz_path, show_keypoints=False,
-            fast_viz=False, opencv_display=False,
-            opencv_title='Matches', small_text=small_text
-        )
-        print(f"🖼️ 匹配圖已輸出：{viz_path}")
-
-def run_matching(matching, device, img0_path, img1_path,
-                 enable_viz=False, top_k='all', output_dir=Path("output")):
-    print(f"\n🔍 開始匹配：\n  圖片1: {img0_path}\n  圖片2: {img1_path}")
-
-    output_dir.mkdir(parents=True, exist_ok=True)
-    w0, h0 = Image.open(img0_path).size
-    w1, h1 = Image.open(img1_path).size
-
-    resize_wh = [640, 480]
-    image0, inp0, _ = read_image(img0_path, device, resize_wh, 0, False)
-    image1, inp1, _ = read_image(img1_path, device, resize_wh, 0, False)
-
-    if image0 is None or image1 is None:
-        print("❌ 圖片讀取失敗")
-        return
-
-    scale0 = (w0 / resize_wh[0], h0 / resize_wh[1])
-    scale1 = (w1 / resize_wh[0], h1 / resize_wh[1])
-
-    pred = matching({'image0': inp0, 'image1': inp1})
-    pred = {k: v[0].detach().cpu().numpy() for k, v in pred.items()}
-
-    matches = pred['matches0']
-    conf = pred['matching_scores0']
-    kpts0, kpts1 = pred['keypoints0'], pred['keypoints1']
-    valid = matches > -1
-    mkpts0 = kpts0[valid]
-    mkpts1 = kpts1[matches[valid]]
-    mconf = conf[valid]
-
-    print(f"✅ 匹配完成！成功匹配點數：{len(mkpts0)}")
-
-    img0_name = Path(img0_path).stem
-    img1_name = Path(img1_path).stem
-    output_path = output_dir / f"{img0_name}_{img1_name}_matches.png"
-
-    save_json_and_optional_plot(
-        image0, image1, kpts0, kpts1,
-        mkpts0, mkpts1, mconf,
-        output_path, draw_plot=enable_viz, top_k=top_k,
-        scale0=scale0, scale1=scale1
-    )
-
-# =======================
-# ===== main.py 原本流程 =====
-# =======================
-
-# 狀態變數
+# requesting_coordinate 控制 send_request_coordinate 是否持續送出 request_json
+# awaiting_response    控制避免重複發送 request_json
 requesting_coordinate = True
 awaiting_response = False
 first_capture = True
 
+# 初始化 LightGlue 模型
 matching, device = init_model()
 
-# 重置 serial_number
+# =======================
+# ===== 重置 serial_number =====
+# =======================
 def reset_serial_number():
     execution_path = Path(__file__).resolve().parent.parent / "execution.json"
     with open(execution_path, "w", encoding="utf-8") as f:
         json.dump({"serial_numbers": 1}, f, indent=4, ensure_ascii=False)
     print("🔄 已將 serial_number 重置為 1")
 
-# 訊息解析
+# =======================
+# ===== 訊息解析 =====
+# =======================
 def process_message(message: str):
     try:
         data = json.loads(message)
     except json.JSONDecodeError:
         print("訊息格式錯誤，無法解析")
         return None
+
     notification = data.get("notification")
     if notification:
         print(f"收到通知: {notification}")
@@ -176,7 +48,9 @@ def process_message(message: str):
         print("訊息中未包含 notification 欄位")
         return None
 
-# 定時請求 JSON
+# =======================
+# ===== 定時請求 JSON =====
+# =======================
 async def send_request_coordinate(websocket):
     global requesting_coordinate, awaiting_response
     while True:
@@ -187,7 +61,9 @@ async def send_request_coordinate(websocket):
             print(f"送出請求訊息：{request_msg}")
         await asyncio.sleep(3)
 
-# LightGlue 匹配流程
+# =======================
+# ===== LightGlue 匹配流程 =====
+# =======================
 def run_lightglue(matching, device):
     execution_path = Path(__file__).resolve().parent.parent / "execution.json"
     with open(execution_path, 'r', encoding='utf-8') as f:
@@ -204,7 +80,9 @@ def run_lightglue(matching, device):
     run_matching(matching, device, img0, img1,
                  enable_viz=True, top_k='all', output_dir=output_dir)
 
-# 處理回應
+# =======================
+# ===== 處理回應 =====
+# =======================
 async def handle_message(result: str, websocket):
     global requesting_coordinate, awaiting_response, first_capture
 
@@ -214,6 +92,7 @@ async def handle_message(result: str, websocket):
             awaiting_response = False
             requesting_coordinate = False
 
+            # 觸發 Cesium 重載
             renew = json.dumps({"action": "renew_cesium"})
             await websocket.send(renew)
             print(f"送出 renew_cesium：{renew}")
@@ -225,6 +104,7 @@ async def handle_message(result: str, websocket):
 
             requesting_coordinate = True
 
+            # 更新 serial_number
             execution_path = Path(__file__).resolve().parent.parent / "execution.json"
             with open(execution_path, "r", encoding="utf-8") as f:
                 config = json.load(f)
@@ -243,7 +123,7 @@ async def handle_message(result: str, websocket):
             await asyncio.sleep(1.5)
 
         case "got_cesium_picture":
-            print("收到 got_cesium_picture，開始匹配")
+            print("收到 got_cesium_picture，開始 LightGlue 匹配")
             await websocket.send(json.dumps({"action": "status_update", "step": "lightglue"}))
             run_lightglue(matching, device)
             msg = json.dumps({"action": "request_coordinate"})
@@ -252,8 +132,115 @@ async def handle_message(result: str, websocket):
             print(f"✅ 匹配完成，送出 request_coordinate：{msg}")
 
         case "got_match_world_coordinates":
-            print("PnP 配對流程略，保持原本 main.py 邏輯")
-            # 可保留你的 PnP 處理
+            print("開始進行 PnP 配對")
+            awaiting_response = False
+            requesting_coordinate = False
+
+            # 讀取 serial_number
+            execution_path = Path(__file__).resolve().parent.parent / "execution.json"
+            with open(execution_path, "r", encoding="utf-8") as f:
+                config = json.load(f)
+            serial_number = str(config["serial_numbers"])
+
+            # 組 match JSON 路徑
+            base = Path(__file__).resolve().parent.parent
+            match_path = base / "data_base" / serial_number / "c" / "respiberry_cesium_matches.json"
+
+            try:
+                result = run_solvepnp_from_json(str(match_path))
+            except Exception as e:
+                print(f"解算時發生錯誤：{e}")
+                result = None
+
+            if result is None:
+                print("❌ PnP 解算失敗，使用上一筆座標")
+                prev_sn = config["serial_numbers"] - 1
+                prev_info_path = base / "data_base" / str(prev_sn) / "a" / "flight_information.json"
+                lat = lon = height = 0.0
+                heading = pitch = roll = None
+                if prev_info_path.exists():
+                    with open(prev_info_path, "r", encoding="utf-8") as f:
+                        prev_info = json.load(f)
+                        lat = prev_info.get("latitude", 0.0)
+                        lon = prev_info.get("longitude", 0.0)
+                        height = prev_info.get("height", 0.0)
+                        heading = prev_info.get("heading")
+                        pitch = prev_info.get("pitch")
+                        roll = prev_info.get("roll")
+
+                await websocket.send(json.dumps({"action": "status_update", "step": "calculation_done"}))
+                await websocket.send(json.dumps({
+                    "action": "calculation_result",
+                    "latitude": lat,
+                    "longitude": lon,
+                    "height": height,
+                    "heading": heading,
+                    "pitch": pitch,
+                    "roll": roll,
+                    "status": "failed",
+                    "note": "解算失敗"
+                }))
+
+                info_path = base / "data_base" / serial_number / "a" / "flight_information.json"
+                info_path.parent.mkdir(parents=True, exist_ok=True)
+                if info_path.exists():
+                    with open(info_path, "r", encoding="utf-8") as f:
+                        info = json.load(f)
+                else:
+                    info = {}
+
+                info.update({
+                    "latitude": lat,
+                    "longitude": lon,
+                    "height": height,
+                    "heading": heading,
+                    "pitch": pitch,
+                    "roll": roll,
+                    "calculated": False,
+                    "status": "failed",
+                    "note": "解算失敗"
+                })
+                with open(info_path, "w", encoding="utf-8") as f:
+                    json.dump(info, f, indent=4, ensure_ascii=False)
+                print(f"📝 已寫入失敗定位結果：{info_path}")
+
+            else:
+                lat, lon, height = result
+                print(f"相機 WGS84 位置：緯度={lat:.6f}, 經度={lon:.6f}, 高度={height:.2f}m")
+                await websocket.send(json.dumps({"action": "status_update", "step": "calculation_done"}))
+                await websocket.send(json.dumps({
+                    "action": "calculation_result",
+                    "latitude": lat,
+                    "longitude": lon,
+                    "height": height,
+                    "status": "ok"
+                }))
+
+                info_path = base / "data_base" / serial_number / "a" / "flight_information.json"
+                info_path.parent.mkdir(parents=True, exist_ok=True)
+                if info_path.exists():
+                    with open(info_path, "r", encoding="utf-8") as f:
+                        info = json.load(f)
+                else:
+                    info = {}
+
+                info.update({
+                    "latitude": lat,
+                    "longitude": lon,
+                    "height": height,
+                    "calculated": True,
+                    "status": "ok"
+                })
+                with open(info_path, "w", encoding="utf-8") as f:
+                    json.dump(info, f, indent=4, ensure_ascii=False)
+                print(f"📝 已寫入定位結果：{info_path}")
+
+            # 更新 serial_number
+            config["serial_numbers"] += 1
+            with open(execution_path, "w", encoding="utf-8") as f:
+                json.dump(config, f, indent=4, ensure_ascii=False)
+            print(f"🔁 序號更新為 {config['serial_numbers']}，開始下一輪")
+            requesting_coordinate = True
 
         case None:
             print("未能解析訊息，略過")
@@ -263,11 +250,11 @@ async def handle_message(result: str, websocket):
             print(f"收到未知通知: {other}")
             awaiting_response = False
 
-# 主程式
+# =======================
+# ===== 主程式 =====
+# =======================
 async def main():
     uri = "ws://localhost:8080"
-    # websocket 連線模組假設存在
-    from module.websocket import connect_and_handshake, listen_one
     websocket = await connect_and_handshake(uri)
     try:
         task = asyncio.create_task(send_request_coordinate(websocket))
